@@ -107,7 +107,7 @@ def main(device="cpu"):
             models=[
                 (LGBModel(), 0.3),
                 (XGBModel(), 0.3),
-                (TransformerModel(d_feat=360, GPU=1 if device != "cpu" else 0), 0.4)
+                (TransformerModel(d_feat=360, GPU=0 if device.startswith("cuda") else -1), 0.4)
             ],
             method="average",
             decay=0.5
@@ -124,4 +124,8 @@ def main(device="cpu"):
 
 if __name__ == "__main__":
     freeze_support()
-    main()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device", type=str, default="cpu", help="Device to use, e.g., 'cpu' or 'cuda' or 'cuda:0'")
+    args = parser.parse_args()
+    main(device=args.device)
