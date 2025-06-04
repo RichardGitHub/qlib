@@ -50,3 +50,5 @@ tags
 ./pretrain
 .idea/
 .aider*
+
+qlib_data/

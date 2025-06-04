@@ -1,0 +1,38 @@
+# 特征工程配置文件
+# 用于配置各种技术指标的参数，避免Rolling(ATTR, 0)警告
+
+feature_config:
+  # 移动平均线配置
+  ma:
+    windows: [5, 10, 20, 30]  # 移动平均窗口
+    min_window: 5             # 最小窗口大小
+  
+  # MACD配置
+  macd:
+    fast_period: 12    # 快线周期
+    slow_period: 26    # 慢线周期
+    signal_period: 9   # 信号线周期
+    min_period: 5      # 最小周期
+  
+  # RSI相对强弱指数配置
+  rsi:
+    window: 14         # RSI计算窗口
+    min_window: 5      # 最小窗口大小
+  
+  # OBV能量潮指标配置
+  obv:
+    window: 20         # OBV计算窗口
+    volume_window: 20  # 成交量平均窗口
+    min_window: 5      # 最小窗口大小
+
+# 数据质量控制
+data_quality:
+  max_missing_ratio: 0.1    # 最大缺失值比例
+  max_inf_count: 100        # 最大无限值数量
+  min_variance: 1e-8        # 最小方差阈值
+
+# 日志配置
+logging:
+  level: INFO
+  format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+  file: 'qlib_predict.log'

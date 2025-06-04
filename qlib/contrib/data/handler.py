@@ -114,6 +114,9 @@ class Alpha158(DataHandlerLP):
         infer_processors = check_transform_proc(infer_processors, fit_start_time, fit_end_time)
         learn_processors = check_transform_proc(learn_processors, fit_start_time, fit_end_time)
 
+        # 先设置instruments属性，以便在get_feature_config中使用
+        self.instruments = instruments
+        
         data_loader = {
             "class": "QlibDataLoader",
             "kwargs": {
@@ -126,6 +129,7 @@ class Alpha158(DataHandlerLP):
                 "inst_processors": inst_processors,
             },
         }
+        # print("AlphaSimpleCustom config:", data_loader)
         super().__init__(
             instruments=instruments,
             start_time=start_time,
@@ -141,7 +145,7 @@ class Alpha158(DataHandlerLP):
         conf = {
             "kbar": {},
             "price": {
-                "windows": [0],
+                "windows": [max(1, w) for w in [1]],
                 "feature": ["OPEN", "HIGH", "LOW", "VWAP"],
             },
             "rolling": {},
@@ -155,3 +159,305 @@ class Alpha158(DataHandlerLP):
 class Alpha158vwap(Alpha158):
     def get_label_config(self):
         return ["Ref($vwap, -2)/Ref($vwap, -1) - 1"], ["LABEL0"]
+
+class AlphaSimpleCustom(Alpha158):
+    def get_feature_config(self):
+        # 8个因子：5/10/20/30/60日均线比值，macd，rsi，obv，布林带，atr，stoch
+        conf = {
+            "ma": {"windows": [max(1, w) for w in [5, 10, 20, 30, 60]]},
+            "macd": {},
+            "rsi": {"window": max(1, 14)},
+            "obv": {},
+            "bollinger": {"window": max(1, 20), "std_dev": 2},
+            #"atr": {"window": max(1, 14)},
+            "stoch": {"k_window": max(1, 14), "d_window": max(1, 3)}
+        }
+        return self.parse_config_to_fields(conf)
+
+    @staticmethod
+    def parse_config_to_fields(config):
+        fields = []
+        names = []
+
+        # 移动平均线因子
+        if "ma" in config:
+            windows = config["ma"].get("windows", [])
+            fields += ["Mean($close, %d)/$close" % d for d in windows]
+            names += ["MA%d" % d for d in windows]
+
+        # MACD因子
+        if "macd" in config:
+            MACD_EXP = '(EMA($close, 12) - EMA($close, 26))/$close - EMA((EMA($close, 12) - EMA($close, 26))/$close, 9)/$close'
+            fields += [MACD_EXP]
+            names += ["MACD"]
+
+        # RSI相对强弱指数
+        if "rsi" in config:
+            rsi_window = config["rsi"].get("window", 14)
+            rsi_window = max(1, rsi_window)  # 确保窗口参数大于0
+            RSI_EXP = f'''
+            100 - (100 / (1 + (
+                Mean(
+                    If($close > Ref($close, 1), $close - Ref($close, 1), 0),
+                    {rsi_window}
+                ) /
+                Mean(
+                    If($close < Ref($close, 1), Ref($close, 1) - $close, 0),
+                    {rsi_window}
+                )
+            )))
+            '''
+            fields += [RSI_EXP]
+            names += ["RSI"]
+
+        # OBV能量潮指标
+        if "obv" in config:
+            obv_window = config["obv"].get("window", 20)
+            volume_window = config["obv"].get("volume_window", 20)
+            obv_window = max(1, obv_window)
+            volume_window = max(1, volume_window)
+
+            OBV_EXP = f'''
+            Sum(
+                If($close > Ref($close, 1), $volume,
+                If($close < Ref($close, 1), 0-$volume, 0)),
+                {obv_window}
+            ) / Mean($volume, {volume_window})
+            '''
+            fields += [OBV_EXP]
+            names += ["OBV"]
+
+        # Bollinger Bands 中心线与收盘价比值
+        if "bollinger" in config:
+            window = config["bollinger"].get("window", 20)
+            std_dev = config["bollinger"].get("std_dev", 2)
+            window = max(1, window)  # 确保窗口参数大于0
+            BOLL_MID = f'Mean($close, {window})'
+            BOLL_EXP = f'({BOLL_MID} - $close) / (Std($close, {window}) * {std_dev})'
+            fields += [BOLL_EXP]
+            names += ["BOLL"]
+
+        # ATR 平均真实波幅
+        if "atr" in config:
+            atr_window = config["atr"].get("window", 14)
+            atr_window = max(1, atr_window)  # 确保窗口参数大于0
+            print("ATR window:", atr_window)
+            # ATR = Mean(True Range, window), True Range = Max(H-L, |H-C_prev|, |L-C_prev|)
+            TR1 = '($high - $low)'
+            TR2 = 'Abs($high - Ref($close, 1))'
+            TR3 = 'Abs($low - Ref($close, 1))'
+            ATR_EXP = f'Mean(Max(Max({TR1}, {TR2}), {TR3}), {atr_window}) / $close'
+            print("ATR exp:", ATR_EXP)
+            fields += [ATR_EXP]
+            names += ["ATR"]
+
+        # Stochastic Oscillator (随机指标)
+        if "stoch" in config:
+            k_window = config["stoch"].get("k_window", 14)
+            d_window = config["stoch"].get("d_window", 3)
+            # 确保窗口参数大于0
+            k_window = max(1, k_window)
+            d_window = max(1, d_window)
+            RSV = f'( $close - Min($low, {k_window}) ) / ( Max($high, {k_window}) - Min($low, {k_window}) )'
+            K_EXP = f'Mean({RSV}, {d_window})'
+            fields += [K_EXP]
+            names += ["STOCH_K"]
+
+        return fields, names
+
+from qlib import __version__ as __qlib_version__
+
+class DynamicAlphaCustom(Alpha158):
+    """动态适配不同股票池的特征处理器"""
+    def __init__(self, **kwargs):
+        self._check_qlib_version()
+        super().__init__(**kwargs)
+    
+    def _check_qlib_version(self):
+        """验证QLib版本兼容性"""
+        from distutils.version import LooseVersion
+        if LooseVersion(__qlib_version__) < LooseVersion("0.9.6"):
+            logger.warning(f"QLib {__qlib_version__} may have different API signatures")
+    # 不同股票池的特征配置模板
+    FEATURE_TEMPLATES = {
+        "default": {
+            "ma": {"windows": [max(1, w) for w in [5, 10, 20, 30, 60]]},
+            "macd": {},
+            "rsi": {"window": max(1, 14)},
+            "obv": {},
+            "bollinger": {"window": max(1, 20), "std_dev": 2},
+            #"atr": {"window": max(1, 14)},
+            "stoch": {"k_window": max(1, 14), "d_window": max(1, 3)}
+        },
+        "csi300": {
+            "ma": {"windows": [max(1, w) for w in [5, 10, 20, 30, 60]]},
+            "macd": {},
+            "rsi": {"window": max(1, 14)},
+            "obv": {},
+            "bollinger": {"window": max(1, 20), "std_dev": 2},
+            #"atr": {"window": max(1, 14)},
+            "stoch": {"k_window": max(1, 14), "d_window": max(1, 3)}
+        },
+        "csi500": {
+            "ma": {"windows": [max(1, w) for w in [5, 10, 20, 30, 60]]},
+            "macd": {},
+            "rsi": {"window": max(1, 14)},
+            "obv": {},
+            "bollinger": {"window": max(1, 20), "std_dev": 2},
+            #"atr": {"window": max(1, 14)},
+            "stoch": {"k_window": max(1, 14), "d_window": max(1, 3)},
+            "volatility": {"window": 20}  # 新增波动率特征
+        },
+        "csi800": {
+            "ma": {"windows": [max(1, w) for w in [5, 10, 20, 30, 60]]},
+            "macd": {},
+            "rsi": {"window": max(1, 14)},
+            "obv": {},
+            "bollinger": {"window": max(1, 20), "std_dev": 2},
+            #"atr": {"window": max(1, 14)},
+            "stoch": {"k_window": max(1, 14), "d_window": max(1, 3)},
+            "liquidity": {"window": 5}  # 流动性特征
+        },
+        "all": {
+            "ma": {"windows": [max(1, w) for w in [5, 10, 20, 30, 60]]},
+            "macd": {},
+            "rsi": {"window": max(1, 14)},
+            "obv": {},
+            "bollinger": {"window": max(1, 20), "std_dev": 2},
+            #"atr": {"window": max(1, 14)},
+            "stoch": {"k_window": max(1, 14), "d_window": max(1, 3)},
+            "cap_tier": {}  # 市值分层特征
+        }
+    }    
+    def get_feature_config(self) -> tuple:
+        """动态选择特征配置"""
+        if "csi300" in self.instruments:
+            template = self.FEATURE_TEMPLATES["csi300"]
+        elif "csi500" in self.instruments:
+            template = self.FEATURE_TEMPLATES["csi500"]
+        elif "csi800" in self.instruments:
+            template = self.FEATURE_TEMPLATES["csi800"]
+        elif "all" in self.instruments:
+            template = self.FEATURE_TEMPLATES["all"]
+        else:
+            template = self.FEATURE_TEMPLATES["default"]
+        
+        return self._parse_config(template)
+    
+    def _parse_config(self, config: dict) -> tuple:
+        """解析配置为QLib字段"""
+        fields, names = [], []
+        
+        # MA特征
+        if "ma" in config:
+            for w in config["ma"]["windows"]:
+                fields.append(f"Mean($close, {w})/$close")
+                names.append(f"MA{w}")
+       
+        # MACD因子
+        if "macd" in config:
+            MACD_EXP = '(EMA($close, 12) - EMA($close, 26))/$close - EMA((EMA($close, 12) - EMA($close, 26))/$close, 9)/$close'
+            fields += [MACD_EXP]
+            names += ["MACD"]
+
+        # RSI相对强弱指数
+        if "rsi" in config:
+            rsi_window = config["rsi"].get("window", 14)
+            rsi_window = max(1, rsi_window)  # 确保窗口参数大于0
+            RSI_EXP = f'''
+            100 - (100 / (1 + (
+                Mean(
+                    If($close > Ref($close, 1), $close - Ref($close, 1), 0),
+                    {rsi_window}
+                ) /
+                Mean(
+                    If($close < Ref($close, 1), Ref($close, 1) - $close, 0),
+                    {rsi_window}
+                )
+            )))
+            '''
+            fields += [RSI_EXP]
+            names += ["RSI"]
+
+        # OBV能量潮指标
+        if "obv" in config:
+            obv_window = config["obv"].get("window", 20)
+            volume_window = config["obv"].get("volume_window", 20)
+            obv_window = max(1, obv_window)
+            volume_window = max(1, volume_window)
+
+            OBV_EXP = f'''
+            Sum(
+                If($close > Ref($close, 1), $volume,
+                If($close < Ref($close, 1), 0-$volume, 0)),
+                {obv_window}
+            ) / Mean($volume, {volume_window})
+            '''
+            fields += [OBV_EXP]
+            names += ["OBV"]
+
+        # Bollinger Bands 中心线与收盘价比值
+        if "bollinger" in config:
+            window = config["bollinger"].get("window", 20)
+            std_dev = config["bollinger"].get("std_dev", 2)
+            window = max(1, window)  # 确保窗口参数大于0
+            BOLL_MID = f'Mean($close, {window})'
+            BOLL_EXP = f'({BOLL_MID} - $close) / (Std($close, {window}) * {std_dev})'
+            fields += [BOLL_EXP]
+            names += ["BOLL"]
+
+        # ATR 平均真实波幅
+        if "atr" in config:
+            atr_window = config["atr"].get("window", 14)
+            atr_window = max(1, atr_window)  # 确保窗口参数大于0
+            print("ATR window:", atr_window)
+            # ATR = Mean(True Range, window), True Range = Max(H-L, |H-C_prev|, |L-C_prev|)
+            TR1 = '($high - $low)'
+            TR2 = 'Abs($high - Ref($close, 1))'
+            TR3 = 'Abs($low - Ref($close, 1))'
+            ATR_EXP = f'Mean(Max(Max({TR1}, {TR2}), {TR3}), {atr_window}) / $close'
+            print("ATR exp:", ATR_EXP)
+            fields += [ATR_EXP]
+            names += ["ATR"]
+
+        # Stochastic Oscillator (随机指标)
+        if "stoch" in config:
+            k_window = config["stoch"].get("k_window", 14)
+            d_window = config["stoch"].get("d_window", 3)
+            # 确保窗口参数大于0
+            k_window = max(1, k_window)
+            d_window = max(1, d_window)
+            RSV = f'( $close - Min($low, {k_window}) ) / ( Max($high, {k_window}) - Min($low, {k_window}) )'
+            K_EXP = f'Mean({RSV}, {d_window})'
+            fields += [K_EXP]
+            names += ["STOCH_K"]
+        
+        # 波动率特征 (中盘股专用)
+        if "volatility" in config and ("csi500" in self.instruments or "csi800" in self.instruments):
+            w = config["volatility"]["window"]
+            fields.append(f"Std($close, {w})/$close")
+            names.append(f"VOL{w}")
+        
+        # 流动性特征 (全A股专用)
+        if "liquidity" in config and ("csi800" in self.instruments or "all" in self.instruments):
+            w = config["liquidity"]["window"]
+            fields.append(f"Mean($volume, {w})")
+            names.append(f"LIQ{w}")
+        
+        return fields, names
+    
+    def get_label_expression(instruments: str) -> tuple:
+        """动态生成兼容不同QLib版本的标签表达式"""
+        base_expr = "Ref($close, -5)/$close - 1"
+        
+        if __qlib_version__ >= "0.9.6":
+            quantile_expr = f"Quantile({base_expr}, qscore=0.7)"
+        else:
+            quantile_expr = f"Quantile({base_expr}, 0.7)"
+        
+        if "csi300" in instruments.lower():
+            return [f"{base_expr} > 0.02"], ["LABEL0"]
+        elif "csi500" in instruments.lower():
+            return [f"{base_expr} > 0.03"], ["LABEL0"]
+        else:
+            return [f"{base_expr} > {quantile_expr}"], ["LABEL0"]

@@ -1,0 +1,28 @@
+# 数据配置
+data:
+  start_time: "2015-01-01"
+  end_time: "2025-12-31"
+  fit_start_time: "2015-01-01"
+  fit_end_time: "2022-12-31"
+  instruments: "csi300"
+
+# 模型配置
+models:
+  lgb:
+    n_estimators: 100
+    learning_rate: 0.1
+  transformer:
+    d_model: 64
+    nhead: 8
+    num_layers: 3
+  ensemble:
+    decay: 0.5
+    method: "average"
+
+# 特征配置
+features:
+  ma_windows: [5, 10, 20, 30, 60]
+  rsi_window: 14
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
