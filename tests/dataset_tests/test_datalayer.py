@@ -6,6 +6,7 @@ from qlib.tests import TestAutoData
 
 class TestDataset(TestAutoData):
     def testCSI300(self):
+       
         close_p = D.features(D.instruments("csi300"), ["$close"])
         size = close_p.groupby("datetime", group_keys=False).size()
         cnt = close_p.groupby("datetime", group_keys=False).count()["$close"]

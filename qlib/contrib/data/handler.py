@@ -7,6 +7,7 @@ from ...data.dataset.processor import Processor
 from ...utils import get_callable_kwargs
 from ...data.dataset import processor as processor_module
 from inspect import getfullargspec
+import numpy as np
 
 
 def check_transform_proc(proc_l, fit_start_time, fit_end_time):
@@ -316,7 +317,10 @@ class DynamicAlphaCustom(Alpha158):
             "bollinger": {"window": max(1, 20), "std_dev": 2},
             #"atr": {"window": max(1, 14)},
             "stoch": {"k_window": max(1, 14), "d_window": max(1, 3)},
-            "liquidity": {"window": 5}  # 流动性特征
+            "volatility": {"window": 20},  # 波动率特征
+            "liquidity": {"window": 5},    # 流动性特征
+            "turnover": {"window": 5},     # 换手率特征
+            "cap_tier": {}                  # 市值分层特征
         },
         "all": {
             "ma": {"windows": [max(1, w) for w in [5, 10, 20, 30, 60]]},
@@ -329,8 +333,8 @@ class DynamicAlphaCustom(Alpha158):
             "cap_tier": {}  # 市值分层特征
         }
     }    
-    def get_feature_config(self) -> tuple:
-        """动态选择特征配置"""
+    def get_feature_config(self):
+        """动态选择特征配置，并监控特征覆盖率和分布"""
         if "csi300" in self.instruments:
             template = self.FEATURE_TEMPLATES["csi300"]
         elif "csi500" in self.instruments:
@@ -341,8 +345,14 @@ class DynamicAlphaCustom(Alpha158):
             template = self.FEATURE_TEMPLATES["all"]
         else:
             template = self.FEATURE_TEMPLATES["default"]
-        
-        return self._parse_config(template)
+        fields, names = self._parse_config(template)
+        # 特征覆盖率监控（如有历史特征）
+        if hasattr(self, 'prev_feat_names') and self.prev_feat_names:
+            coverage, common = FeatureAlignmentHelper.compute_coverage(self.prev_feat_names, names)
+            print(f"特征迁移覆盖率: {coverage:.2%}, 公共特征数: {len(common)}")
+        # 可选：特征分布可视化（需传入特征矩阵）
+        # FeatureAlignmentHelper.visualize_feature_distribution(feature_matrix, names, logger=None)
+        return fields, names
     
     def _parse_config(self, config: dict) -> tuple:
         """解析配置为QLib字段"""
@@ -444,20 +454,134 @@ class DynamicAlphaCustom(Alpha158):
             fields.append(f"Mean($volume, {w})")
             names.append(f"LIQ{w}")
         
+         # 换手率特征
+        if "turnover" in config:
+            window = config["turnover"].get("window", 5)
+            window = max(1, window)
+            TURNOVER_EXP = f"$volume / Mean($volume, {window})"
+            fields.append(TURNOVER_EXP)
+            names.append(f"TURNOVER{window}")
+
+        # 市值分层特征
+        if "cap_tier" in config:
+            window = config.get("cap_tier_window", 200)
+            CAP_TIER_EXP = f"Rank($amount, {window}) / Count($amount, {window})"
+            fields.append(CAP_TIER_EXP)
+            names.append("CAP_TIER")
+        
         return fields, names
     
-    def get_label_expression(instruments: str) -> tuple:
-        """动态生成兼容不同QLib版本的标签表达式"""
-        base_expr = "Ref($close, -5)/$close - 1"
-        
-        if __qlib_version__ >= "0.9.6":
-            quantile_expr = f"Quantile({base_expr}, qscore=0.7)"
+    @staticmethod
+    def get_label_expression(
+        instruments: str,
+        return_days: int = 5,
+        csi300_thresh: float = 0.02,
+        csi500_thresh: float = 0.03,
+        quantile: float = 0.7,
+        multi_label: bool = False,
+        risk_label: bool = False
+    ) -> tuple:
+        """
+        动态生成兼容不同QLib版本的标签表达式，支持：
+        1. 参数化阈值/分位数
+        2. 多标签/多分类
+        3. 支持风险标签
+        4. 多标签+风险标签
+        """
+        base_expr = f"Ref($close, -{return_days})/$close - 1"
+        quantile_window = 200  # 默认窗口长度
+        if '__qlib_version__' in globals() and __qlib_version__ >= "0.9.6":
+            quantile_expr = f"Quantile({base_expr}, {quantile_window}, qscore={quantile})"
         else:
-            quantile_expr = f"Quantile({base_expr}, 0.7)"
-        
-        if "csi300" in instruments.lower():
-            return [f"{base_expr} > 0.02"], ["LABEL0"]
-        elif "csi500" in instruments.lower():
-            return [f"{base_expr} > 0.03"], ["LABEL0"]
+            quantile_expr = f"Quantile({base_expr}, {quantile_window}, {quantile})"
+
+        # 多标签+风险标签同时启用
+        if multi_label and risk_label:
+            high_label = f"{base_expr} > {quantile_expr}"
+            low_label = f"{base_expr} < Quantile({base_expr}, {quantile_window}, qscore=0.3)"
+            drawdown_expr = f"(Min(Ref($close, -1, {return_days}), $close) - $close) / $close"
+            drawdown_label = f"{drawdown_expr} < -0.05"  # 5日最大回撤大于5%"
+            return [high_label, low_label, drawdown_label], ["LABEL_HIGH", "LABEL_LOW", "LABEL_DRAWDOWN"]
+
+        # 1. 单标签（默认）
+        if not multi_label and not risk_label:
+            if "csi300" in str(instruments).lower():
+                return [f"{base_expr} > {csi300_thresh}"], ["LABEL0"]
+            elif "csi500" in str(instruments).lower():
+                return [f"{base_expr} > {csi500_thresh}"], ["LABEL0"]
+            else:
+                return [f"{base_expr} > {quantile_expr}"], ["LABEL0"]
+
+        # 2. 多标签/多分类
+        if multi_label and not risk_label:
+            high_label = f"{base_expr} > {quantile_expr}"
+            low_label = f"{base_expr} < Quantile({base_expr}, {quantile_window}, qscore=0.3)"
+            return [high_label, low_label], ["LABEL_HIGH", "LABEL_LOW"]
+
+        # 3. 风险标签（如最大回撤）
+        if risk_label:
+            drawdown_expr = f"(Min(Ref($close, -1, {return_days}), $close) - $close) / $close"
+            profit_label = f"{base_expr} > {quantile_expr}"
+            drawdown_label = f"{drawdown_expr} < -0.05"  # 5日最大回撤大于5%"
+            return [profit_label, drawdown_label], ["LABEL_PROFIT", "LABEL_DRAWDOWN"]
+
+        # 兜底：返回单标签
+        if "csi300" in str(instruments).lower():
+            return [f"{base_expr} > {csi300_thresh}"], ["LABEL0"]
+        elif "csi500" in str(instruments).lower():
+            return [f"{base_expr} > {csi500_thresh}"], ["LABEL0"]
         else:
             return [f"{base_expr} > {quantile_expr}"], ["LABEL0"]
+
+    def get_label_config(self, return_days=5, csi300_thresh=0.02, csi500_thresh=0.03, quantile=0.7, multi_label=False, risk_label=False):
+        """
+        动态生成标签表达式，支持参数化和多标签/风险标签
+        """
+        return self.get_label_expression(
+            self.instruments,
+            return_days=return_days,
+            csi300_thresh=csi300_thresh,
+            csi500_thresh=csi500_thresh,
+            quantile=quantile,
+            multi_label=multi_label,
+            risk_label=risk_label
+        )
+
+class FeatureAlignmentHelper:
+    """特征对齐与迁移辅助工具"""
+    @staticmethod
+    def compute_coverage(old_features, new_features):
+        common = set(old_features) & set(new_features)
+        coverage = len(common) / max(1, len(new_features))
+        return coverage, list(common)
+
+    @staticmethod
+    def align_features(old_features, new_features, old_values, fill_method='zero'):
+        """
+        对齐特征：
+        - 新特征用0或均值初始化
+        - 丢失特征用历史均值或0填充
+        """
+        aligned = []
+        for feat in new_features:
+            if feat in old_features:
+                idx = old_features.index(feat)
+                aligned.append(old_values[idx])
+            else:
+                aligned.append(0.0 if fill_method == 'zero' else np.mean(old_values))
+        return np.array(aligned)
+
+    @staticmethod
+    def visualize_feature_distribution(feature_matrix, feature_names, logger=None):
+        desc = {}
+        for i, name in enumerate(feature_names):
+            col = feature_matrix[:, i]
+            desc[name] = {
+                'mean': float(np.mean(col)),
+                'std': float(np.std(col)),
+                'min': float(np.min(col)),
+                'max': float(np.max(col))
+            }
+        if logger:
+            logger.info(f"特征分布统计: {desc}")
+        return desc

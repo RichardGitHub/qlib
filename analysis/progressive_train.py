@@ -143,7 +143,7 @@ def get_dynamic_model(instruments: str, feat_dim: int, device: str) -> DEnsemble
             "trans_params": {
                 "nhead": 4,
                 "d_feat": feat_dim,
-                "d_model": calc_d_model(feat_dim, 4),  # 确保可被4整除
+                "d_model": calc_d_model(feat_dim, 4),
             },
             "weights": [0.4, 0.6],
             "decay": 0.5
@@ -153,17 +153,38 @@ def get_dynamic_model(instruments: str, feat_dim: int, device: str) -> DEnsemble
             "trans_params": {
                 "nhead": 8,
                 "d_feat": feat_dim,
-                "d_model": calc_d_model(feat_dim, 8),  # 确保可被8整除
+                "d_model": calc_d_model(feat_dim, 8),
             },
             "weights": [0.3, 0.7],
             "decay": 0.7
+        },
+        "csi800": {
+            "lgb_params": {"num_leaves": 64, "learning_rate": 0.02, "feature_fraction": 0.8, "bagging_fraction": 0.8},
+            "trans_params": {
+                "nhead": 8,
+                "d_feat": feat_dim,
+                "d_model": calc_d_model(feat_dim, 8),
+                "dropout": 0.2
+            },
+            "weights": [0.5, 0.5],
+            "decay": 0.7
+        },
+        "all": {
+            "lgb_params": {"num_leaves": 64, "learning_rate": 0.01},
+            "trans_params": {
+                "nhead": 8,
+                "d_model": 64,
+                "batch_size": 256
+            },
+            "weights": [0.5, 0.5],
+            "decay": 0.9
         },
         "default": {
             "lgb_params": {"num_leaves": 128, "learning_rate": 0.02},
             "trans_params": {
                 "nhead": 12,
                 "d_feat": feat_dim,
-                "d_model": calc_d_model(feat_dim, 12),  # 确保可被12整除
+                "d_model": calc_d_model(feat_dim, 12),
                 "batch_size": 128
             },
             "weights": [0.2, 0.8],
@@ -298,19 +319,26 @@ def progressive_train_enhanced(
             fit_start_time=start_date,
             fit_end_time=str(int(start_date[:4])+6) + "-12-31"  # 前6年训练
         )
-        
+        # 启用多标签
+        label_expr, label_names = handler.get_label_config(
+            return_days=5,
+            quantile=0.7,
+            multi_label=True,
+            risk_label=True
+        )
         # 获取特征并保存
         features, feat_names = handler.get_feature_config()
         feat_dim = len(features)
         logger.info(f"Feature dimension: {feat_dim}")
-        
         dataset = DatasetH(
             handler=handler,
             segments={
                 "train": (start_date, str(int(start_date[:4])+7) + "-12-31"),
                 "valid": (str(int(start_date[:4])+8) + "-01-01", str(int(start_date[:4])+8) + "-12-31"),
                 "test": (str(int(start_date[:4])+9) + "-01-01", end_date)
-            }
+            },
+            label=label_expr,
+            label_name=label_names
         )
         
         # 2. 模型初始化
@@ -320,10 +348,7 @@ def progressive_train_enhanced(
         prev_model, prev_feat_names = model_manager.load_previous_model(instruments, instruments_order)
         if prev_model and prev_feat_names:
             logger.info("Applying transfer learning...")
-            feat_mapping, common_feats = FeatureProjector.get_feature_mapping(prev_feat_names, feat_names)
-            logger.info(f"Feature transfer: {len(common_feats)} common features")
-            
-            model = transfer_model_weights(prev_model, model, feat_mapping)
+            model = enhanced_feature_transfer(prev_model, prev_feat_names, model, feat_names, dataset)
         
         # 4. 训练
         model.fit(dataset)
@@ -343,6 +368,7 @@ def run_daily_prediction_and_trading_enhanced(model, dataset, instruments, norm_
     backtest_params = {
         "csi300": {"topk": 50, "ndrop": 5},
         "csi500": {"topk": 80, "ndrop": 8},
+        "csi800": {"topk": 40, "ndrop": 8},
         "default": {"topk": 100, "ndrop": 10}
     }
     params = backtest_params.get(instruments, backtest_params["default"])
@@ -401,6 +427,7 @@ def run_daily_prediction_and_trading_enhanced(model, dataset, instruments, norm_
     analysis = enhanced_risk_analysis(report['return'], instruments)
     print(f"\n[Performance Report - {instruments}]")
     print(analysis)
+
 # 在生成策略信号前预处理
 def apply_filters(df):
     # 过滤NaN
@@ -426,6 +453,7 @@ def enhanced_risk_analysis(returns: pd.Series, instruments: str) -> pd.DataFrame
         "Annualized Return": returns.mean() * 252,
         "Volatility": returns.std() * np.sqrt(252),
         "Sharpe Ratio": returns.mean() / returns.std() * np.sqrt(252),
+        "Information Ratio": returns.mean() / returns.std()  * np.sqrt(252) if returns.std()  != 0 else 0,
         "Max Drawdown": (returns.cumsum() - returns.cumsum().cummax()).min(),
         "Win Rate": (returns > 0).mean(),
         #"Benchmark Correlation": returns.corr(qlib.get_data(benchmark, fields="close")),
@@ -433,6 +461,110 @@ def enhanced_risk_analysis(returns: pd.Series, instruments: str) -> pd.DataFrame
     }
     
     return pd.DataFrame.from_dict(analysis, orient='index', columns=['Value'])
+
+def enhanced_feature_transfer(prev_model, prev_feat_names, new_model, new_feat_names, dataset):
+    """
+    增强特征迁移：
+    - 监控特征迁移覆盖率
+    - 监控迁移前后信号相关性
+    - 必要时采用模型融合平滑过渡
+    """
+    feat_mapping, common_feats = FeatureProjector.get_feature_mapping(prev_feat_names, new_feat_names)
+    coverage = np.sum(feat_mapping) / feat_mapping.size
+    logger.info(f"特征迁移覆盖率: {coverage:.2%}，公共特征数: {len(common_feats)}")
+    # 权重迁移
+    new_model = transfer_model_weights(prev_model, new_model, feat_mapping)
+    # 信号相关性监控
+    try:
+        prev_pred = prev_model.predict(dataset, segment="valid")
+        new_pred = new_model.predict(dataset, segment="valid")
+        corr = np.corrcoef(prev_pred, new_pred)[0, 1]
+        logger.info(f"迁移前后信号相关性: {corr:.4f}")
+        if corr < 0.3:
+            logger.warning("信号相关性过低，采用模型融合平滑过渡")
+            new_model = ensemble_model_fusion(prev_model, new_model, alpha=0.5)
+    except Exception as e:
+        logger.warning(f"信号相关性监控失败: {e}")
+    return new_model
+
+def ensemble_model_fusion(prev_model, new_model, alpha=0.5):
+    """
+    模型融合：短期内用新旧模型加权，逐步提升新模型权重
+    """
+    class FusionModel:
+        def __init__(self, m1, m2, alpha_schedule):
+            self.m1 = m1
+            self.m2 = m2
+            self.alpha_schedule = alpha_schedule
+            self.call_count = 0
+        def predict(self, dataset, segment="test"):
+            alpha = self.alpha_schedule[min(self.call_count, len(self.alpha_schedule)-1)]
+            self.call_count += 1
+            p1 = self.m1.predict(dataset, segment=segment)
+            p2 = self.m2.predict(dataset, segment=segment)
+            return alpha * p2 + (1 - alpha) * p1
+        def fit(self, dataset):
+            self.m2.fit(dataset)
+    logger.info(f"融合模型：alpha={alpha}")
+    return FusionModel(prev_model, new_model, alpha_schedule=[alpha])
+
+def rolling_backtest(predictor, instruments, start_date, end_date, window='1M'):
+    """
+    多周期回测：分周期输出回测指标
+    """
+    import pandas as pd
+    dates = pd.date_range(start=start_date, end=end_date, freq=window)
+    results = []
+    for i in range(len(dates)-1):
+        s, e = dates[i].strftime('%Y-%m-%d'), dates[i+1].strftime('%Y-%m-%d')
+        res = predictor.backtest_strategy(instruments, s, e)
+        logger.info(f"{instruments} {s} ~ {e}: {res.get('risk_analysis', {})}")
+        results.append({'start': s, 'end': e, 'result': res})
+    return results
+
+def rolling_train_and_backtest(instruments_order, window='3M', train_span='24M', start='2015-01-01', end='2025-12-31'):
+    """
+    滚动窗口训练：定期用最新数据训练，提升模型对突发市场变化的适应性
+    """
+    import pandas as pd
+    all_dates = pd.date_range(start=start, end=end, freq=window)
+    for i in range(len(all_dates)-1):
+        train_start = (all_dates[i] - pd.DateOffset(months=int(train_span[:-1]))).strftime('%Y-%m-%d')
+        train_end = all_dates[i].strftime('%Y-%m-%d')
+        test_start = all_dates[i].strftime('%Y-%m-%d')
+        test_end = all_dates[i+1].strftime('%Y-%m-%d')
+        # 训练
+        progressive_train_enhanced(
+            instruments_order=instruments_order,
+            start_date=train_start,
+            end_date=train_end
+        )
+        # 回测
+        for inst in instruments_order:
+            predictor = StockPredictor()
+            res = predictor.backtest_strategy(inst, test_start, test_end)
+            logger.info(f"{inst} {test_start}~{test_end}: {res.get('risk_analysis', {})}")
+
+def analyze_holdings(holdings_df, logger=None):
+    freq = holdings_df['instrument'].value_counts()
+    weight_sum = holdings_df.groupby('instrument')['weight'].sum()
+    top_stocks = weight_sum.sort_values(ascending=False).head(10)
+    if logger:
+        logger.info(f"持仓出现频率Top10: {freq.head(10)}")
+        logger.info(f"累计权重Top10: {top_stocks}")
+    return freq, top_stocks
+
+def analyze_signal_distribution(signal, logger=None):
+    desc = signal.describe()
+    if logger:
+        logger.info(f"信号分布统计: {desc}")
+    return desc
+
+def dynamic_topk_n_drop(signal, base_topk=10, base_n_drop=2):
+    std = signal.std()
+    topk = int(base_topk * (1 + std))
+    n_drop = int(base_n_drop * (1 + std))
+    return max(1, topk), max(0, n_drop)
 
 if __name__ == "__main__":
     freeze_support()
