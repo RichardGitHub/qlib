@@ -307,7 +307,9 @@ class DynamicAlphaCustom(Alpha158):
             "bollinger": {"window": max(1, 20), "std_dev": 2},
             #"atr": {"window": max(1, 14)},
             "stoch": {"k_window": max(1, 14), "d_window": max(1, 3)},
-            "volatility": {"window": 20}  # 新增波动率特征
+            "volatility": {"window": 10},  # 新增波动率特征
+            "liquidity": {"window": 3},    # 更高频流动性
+            "turnover": {"window": 3},     # 更高频换手率
         },
         "csi800": {
             "ma": {"windows": [max(1, w) for w in [5, 10, 20, 30, 60]]},

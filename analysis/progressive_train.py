@@ -149,13 +149,14 @@ def get_dynamic_model(instruments: str, feat_dim: int, device: str) -> DEnsemble
             "decay": 0.5
         },
         "csi500": {
-            "lgb_params": {"num_leaves": 64, "learning_rate": 0.03},
+            "lgb_params": {"num_leaves": 128, "learning_rate": 0.02},
             "trans_params": {
-                "nhead": 8,
+                "nhead": 12,
                 "d_feat": feat_dim,
                 "d_model": calc_d_model(feat_dim, 8),
+                "dropout": 0.3
             },
-            "weights": [0.3, 0.7],
+            "weights": [0.4, 0.6],
             "decay": 0.7
         },
         "csi800": {
@@ -320,12 +321,20 @@ def progressive_train_enhanced(
             fit_end_time=str(int(start_date[:4])+6) + "-12-31"  # 前6年训练
         )
         # 启用多标签
-        label_expr, label_names = handler.get_label_config(
-            return_days=5,
-            quantile=0.7,
-            multi_label=True,
-            risk_label=True
-        )
+        if instruments == "csi500":
+            label_expr, label_names = handler.get_label_config(
+                return_days=3,      # 更短持有期
+                quantile=0.8,       # 更高分位数
+                multi_label=True,   # 多标签
+                risk_label=True     # 风险标签
+            )
+        else:
+            label_expr, label_names = handler.get_label_config(
+                return_days=5,
+                quantile=0.7,
+                multi_label=True,
+                risk_label=True
+            )
         # 获取特征并保存
         features, feat_names = handler.get_feature_config()
         feat_dim = len(features)
