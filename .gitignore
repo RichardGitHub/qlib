@@ -52,3 +52,6 @@ tags
 .aider*
 
 qlib_data/
+feature_missing/
+holdings/
+trading_plans/

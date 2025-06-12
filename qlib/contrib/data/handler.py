@@ -279,96 +279,45 @@ class DynamicAlphaCustom(Alpha158):
         from distutils.version import LooseVersion
         if LooseVersion(__qlib_version__) < LooseVersion("0.9.6"):
             logger.warning(f"QLib {__qlib_version__} may have different API signatures")
-    # 不同股票池的特征配置模板
+    # 统一特征模板，确保所有股票池特征一致且无缺失
     FEATURE_TEMPLATES = {
-        "default": {
-            "ma": {"windows": [max(1, w) for w in [5, 10, 20, 30, 60]]},
+        "unified": {
+            "ma": {"windows": [5, 10, 20, 30, 60]},
             "macd": {},
-            "rsi": {"window": max(1, 14)},
+            "rsi": {"window": 14},
             "obv": {},
-            "bollinger": {"window": max(1, 20), "std_dev": 2},
-            #"atr": {"window": max(1, 14)},
-            "stoch": {"k_window": max(1, 14), "d_window": max(1, 3)}
-        },
-        "csi300": {
-            "ma": {"windows": [max(1, w) for w in [5, 10, 20, 30, 60]]},
-            "macd": {},
-            "rsi": {"window": max(1, 14)},
-            "obv": {},
-            "bollinger": {"window": max(1, 20), "std_dev": 2},
-            #"atr": {"window": max(1, 14)},
-            "stoch": {"k_window": max(1, 14), "d_window": max(1, 3)}
-        },
-        "csi500": {
-            "ma": {"windows": [max(1, w) for w in [5, 10, 20, 30, 60]]},
-            "macd": {},
-            "rsi": {"window": max(1, 14)},
-            "obv": {},
-            "bollinger": {"window": max(1, 20), "std_dev": 2},
-            #"atr": {"window": max(1, 14)},
-            "stoch": {"k_window": max(1, 14), "d_window": max(1, 3)},
-            "volatility": {"window": 10},  # 新增波动率特征
-            "liquidity": {"window": 3},    # 更高频流动性
-            "turnover": {"window": 3},     # 更高频换手率
-        },
-        "csi800": {
-            "ma": {"windows": [max(1, w) for w in [5, 10, 20, 30, 60]]},
-            "macd": {},
-            "rsi": {"window": max(1, 14)},
-            "obv": {},
-            "bollinger": {"window": max(1, 20), "std_dev": 2},
-            #"atr": {"window": max(1, 14)},
-            "stoch": {"k_window": max(1, 14), "d_window": max(1, 3)},
-            "volatility": {"window": 20},  # 波动率特征
-            "liquidity": {"window": 5},    # 流动性特征
-            "turnover": {"window": 5},     # 换手率特征
-            "cap_tier": {}                  # 市值分层特征
-        },
-        "all": {
-            "ma": {"windows": [max(1, w) for w in [5, 10, 20, 30, 60]]},
-            "macd": {},
-            "rsi": {"window": max(1, 14)},
-            "obv": {},
-            "bollinger": {"window": max(1, 20), "std_dev": 2},
-            #"atr": {"window": max(1, 14)},
-            "stoch": {"k_window": max(1, 14), "d_window": max(1, 3)},
-            "cap_tier": {}  # 市值分层特征
+            "bollinger": {"window": 20, "std_dev": 2},
+            #"atr": {"window": 14},
+            "stoch": {"k_window": 14, "d_window": 3},
+            "volatility": {"window": 10},   # 统一用10日波动率
+            "liquidity": {"window": 3},     # 统一用3日流动性
+            "turnover": {"window": 3},      # 统一用3日换手率
+            "cap_tier": {}                    # 市值分层
         }
-    }    
+    }
     def get_feature_config(self):
-        """动态选择特征配置，并监控特征覆盖率和分布"""
-        if "csi300" in self.instruments:
-            template = self.FEATURE_TEMPLATES["csi300"]
-        elif "csi500" in self.instruments:
-            template = self.FEATURE_TEMPLATES["csi500"]
-        elif "csi800" in self.instruments:
-            template = self.FEATURE_TEMPLATES["csi800"]
-        elif "all" in self.instruments:
-            template = self.FEATURE_TEMPLATES["all"]
-        else:
-            template = self.FEATURE_TEMPLATES["default"]
+        """所有股票池统一使用unified模板，避免特征缺失"""
+        template = self.FEATURE_TEMPLATES["unified"]
         fields, names = self._parse_config(template)
         # 特征覆盖率监控（如有历史特征）
         if hasattr(self, 'prev_feat_names') and self.prev_feat_names:
             coverage, common = FeatureAlignmentHelper.compute_coverage(self.prev_feat_names, names)
             print(f"特征迁移覆盖率: {coverage:.2%}, 公共特征数: {len(common)}")
-        # 可选：特征分布可视化（需传入特征矩阵）
-        # FeatureAlignmentHelper.visualize_feature_distribution(feature_matrix, names, logger=None)
         return fields, names
     
     def _parse_config(self, config: dict) -> tuple:
-        """解析配置为QLib字段"""
+        """解析配置为QLib字段，所有涉及分母的表达式加Abs()+1e-6保护，减少特征缺失"""
         fields, names = [], []
         
         # MA特征
         if "ma" in config:
             for w in config["ma"]["windows"]:
-                fields.append(f"Mean($close, {w})/$close")
+                fields.append(f"Mean($close, {w})/(Abs($close)+1e-6)")
                 names.append(f"MA{w}")
        
         # MACD因子
         if "macd" in config:
-            MACD_EXP = '(EMA($close, 12) - EMA($close, 26))/$close - EMA((EMA($close, 12) - EMA($close, 26))/$close, 9)/$close'
+            MACD_EXP = '((EMA($close, 12) - EMA($close, 26))/(Abs($close)+1e-6) - EMA((EMA($close, 12) - EMA($close, 26))/(Abs($close)+1e-6), 9)/(Abs($close)+1e-6))'
             fields += [MACD_EXP]
             names += ["MACD"]
 
@@ -382,10 +331,10 @@ class DynamicAlphaCustom(Alpha158):
                     If($close > Ref($close, 1), $close - Ref($close, 1), 0),
                     {rsi_window}
                 ) /
-                Mean(
+                (Mean(
                     If($close < Ref($close, 1), Ref($close, 1) - $close, 0),
                     {rsi_window}
-                )
+                ) + 1e-6)
             )))
             '''
             fields += [RSI_EXP]
@@ -403,7 +352,7 @@ class DynamicAlphaCustom(Alpha158):
                 If($close > Ref($close, 1), $volume,
                 If($close < Ref($close, 1), 0-$volume, 0)),
                 {obv_window}
-            ) / Mean($volume, {volume_window})
+            ) / (Mean($volume, {volume_window})+1e-6)
             '''
             fields += [OBV_EXP]
             names += ["OBV"]
@@ -414,7 +363,7 @@ class DynamicAlphaCustom(Alpha158):
             std_dev = config["bollinger"].get("std_dev", 2)
             window = max(1, window)  # 确保窗口参数大于0
             BOLL_MID = f'Mean($close, {window})'
-            BOLL_EXP = f'({BOLL_MID} - $close) / (Std($close, {window}) * {std_dev})'
+            BOLL_EXP = f'(({BOLL_MID} - $close) / ((Std($close, {window})+1e-6) * {std_dev}))'
             fields += [BOLL_EXP]
             names += ["BOLL"]
 
@@ -422,13 +371,10 @@ class DynamicAlphaCustom(Alpha158):
         if "atr" in config:
             atr_window = config["atr"].get("window", 14)
             atr_window = max(1, atr_window)  # 确保窗口参数大于0
-            print("ATR window:", atr_window)
-            # ATR = Mean(True Range, window), True Range = Max(H-L, |H-C_prev|, |L-C_prev|)
             TR1 = '($high - $low)'
             TR2 = 'Abs($high - Ref($close, 1))'
             TR3 = 'Abs($low - Ref($close, 1))'
-            ATR_EXP = f'Mean(Max(Max({TR1}, {TR2}), {TR3}), {atr_window}) / $close'
-            print("ATR exp:", ATR_EXP)
+            ATR_EXP = f'(Mean(Max(Max({TR1}, {TR2}), {TR3}), {atr_window}) / (Abs($close)+1e-6))'
             fields += [ATR_EXP]
             names += ["ATR"]
 
@@ -439,35 +385,35 @@ class DynamicAlphaCustom(Alpha158):
             # 确保窗口参数大于0
             k_window = max(1, k_window)
             d_window = max(1, d_window)
-            RSV = f'( $close - Min($low, {k_window}) ) / ( Max($high, {k_window}) - Min($low, {k_window}) )'
+            RSV = f'( $close - Min($low, {k_window}) ) / ( (Max($high, {k_window}) - Min($low, {k_window}))+1e-6 )'
             K_EXP = f'Mean({RSV}, {d_window})'
             fields += [K_EXP]
             names += ["STOCH_K"]
         
-        # 波动率特征 (中盘股专用)
-        if "volatility" in config and ("csi500" in self.instruments or "csi800" in self.instruments):
+        # 波动率特征
+        if "volatility" in config:
             w = config["volatility"]["window"]
-            fields.append(f"Std($close, {w})/$close")
+            fields.append(f"Std($close, {w})/(Abs($close)+1e-6)")
             names.append(f"VOL{w}")
         
-        # 流动性特征 (全A股专用)
-        if "liquidity" in config and ("csi800" in self.instruments or "all" in self.instruments):
+        # 流动性特征
+        if "liquidity" in config:
             w = config["liquidity"]["window"]
-            fields.append(f"Mean($volume, {w})")
+            fields.append(f"Mean($volume, {w})+1e-6")
             names.append(f"LIQ{w}")
         
          # 换手率特征
         if "turnover" in config:
             window = config["turnover"].get("window", 5)
             window = max(1, window)
-            TURNOVER_EXP = f"$volume / Mean($volume, {window})"
+            TURNOVER_EXP = f"$volume / (Mean($volume, {window})+1e-6)"
             fields.append(TURNOVER_EXP)
             names.append(f"TURNOVER{window}")
 
         # 市值分层特征
         if "cap_tier" in config:
             window = config.get("cap_tier_window", 200)
-            CAP_TIER_EXP = f"Rank($amount, {window}) / Count($amount, {window})"
+            CAP_TIER_EXP = f"Rank($amount, {window}) / (Count($amount, {window})+1e-6)"
             fields.append(CAP_TIER_EXP)
             names.append("CAP_TIER")
         
@@ -478,7 +424,7 @@ class DynamicAlphaCustom(Alpha158):
         instruments: str,
         return_days: int = 5,
         csi300_thresh: float = 0.02,
-        csi500_thresh: float = 0.03,
+        csi500_thresh: float = 0.02,
         quantile: float = 0.7,
         multi_label: bool = False,
         risk_label: bool = False
@@ -535,7 +481,7 @@ class DynamicAlphaCustom(Alpha158):
         else:
             return [f"{base_expr} > {quantile_expr}"], ["LABEL0"]
 
-    def get_label_config(self, return_days=5, csi300_thresh=0.02, csi500_thresh=0.03, quantile=0.7, multi_label=False, risk_label=False):
+    def get_label_config(self, return_days=5, csi300_thresh=0.02, csi500_thresh=0.02, quantile=0.7, multi_label=False, risk_label=False):
         """
         动态生成标签表达式，支持参数化和多标签/风险标签
         """

@@ -20,13 +20,16 @@ from tqdm import tqdm
 import model_utils
 from multiprocessing import freeze_support
 from qlib.contrib.data.handler import DynamicAlphaCustom
+import itertools
+import matplotlib.pyplot as plt
+from qlib.data import D
 
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('progressive_training.log'),
+        logging.FileHandler('progressive_training.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -306,7 +309,7 @@ def progressive_train_enhanced(
     end_date: str = "2025-12-31"
 ):
     """增强版渐进训练流程"""
-    qlib.init(provider_uri="./qlib_data/cn_data", region=REG_CN)
+    
     model_manager = ProgressiveModelManager()
     
     for instruments in tqdm(instruments_order, desc="Progressive Training"):
@@ -323,7 +326,7 @@ def progressive_train_enhanced(
         # 启用多标签
         if instruments == "csi500":
             label_expr, label_names = handler.get_label_config(
-                return_days=3,      # 更短持有期
+                return_days=5,      # 更短持有期
                 quantile=0.8,       # 更高分位数
                 multi_label=True,   # 多标签
                 risk_label=True     # 风险标签
@@ -331,7 +334,7 @@ def progressive_train_enhanced(
         else:
             label_expr, label_names = handler.get_label_config(
                 return_days=5,
-                quantile=0.7,
+                quantile=0.8,
                 multi_label=True,
                 risk_label=True
             )
@@ -349,7 +352,9 @@ def progressive_train_enhanced(
             label=label_expr,
             label_name=label_names
         )
-        
+      
+        # 新增：输出特征和标签分布日志
+        log_feature_and_label_distribution(handler, dataset, instruments, logger)
         # 2. 模型初始化
         model = get_dynamic_model(instruments, feat_dim, device)
         
@@ -435,7 +440,8 @@ def run_daily_prediction_and_trading_enhanced(model, dataset, instruments, norm_
     # 改进的风险分析
     analysis = enhanced_risk_analysis(report['return'], instruments)
     print(f"\n[Performance Report - {instruments}]")
-    print(analysis)
+    logger.info(analysis)
+    #print(analysis)
 
 # 在生成策略信号前预处理
 def apply_filters(df):
@@ -575,9 +581,198 @@ def dynamic_topk_n_drop(signal, base_topk=10, base_n_drop=2):
     n_drop = int(base_n_drop * (1 + std))
     return max(1, topk), max(0, n_drop)
 
+# 新增：批量参数实验与自动化胜率优化
+
+def log_feature_and_label_distribution(handler, dataset, instruments_name, logger):
+    # 特征分布
+    try:
+        df_feat = dataset.prepare("train", col_set="feature")
+        # logger.info(f"[{instruments_name}] 过滤前特征分布:\n{df_feat.shape}")
+        # # 自动过滤高缺失股票和高缺失日期，兼容MultiIndex
+        # if isinstance(df_feat.index, pd.MultiIndex):
+        #     # 过滤高缺失股票
+        #     instruments = df_feat.index.get_level_values('instrument')
+        #     stock_missing = instruments.value_counts()
+        #     high_missing_stocks = stock_missing[stock_missing > 100].index
+        #     mask_stock = ~instruments.isin(high_missing_stocks)
+        #     df_feat = df_feat[mask_stock]
+        #     # 过滤高缺失日期
+        #     datetimes = df_feat.index.get_level_values('datetime')
+        #     date_missing = datetimes.value_counts()
+        #     high_missing_dates = date_missing[date_missing > 50].index
+        #     mask_date = ~datetimes.isin(high_missing_dates)
+        #     df_feat = df_feat[mask_date]
+        # else:
+        #     instruments = df_feat['instrument'] if 'instrument' in df_feat.columns else None
+        #     datetimes = df_feat['datetime'] if 'datetime' in df_feat.columns else None
+        #     if instruments is not None:
+        #         stock_missing = instruments.value_counts()
+        #         high_missing_stocks = stock_missing[stock_missing > 100].index
+        #         mask_stock = ~instruments.isin(high_missing_stocks)
+        #         df_feat = df_feat[mask_stock]
+        #     if datetimes is not None:
+        #         date_missing = datetimes.value_counts()
+        #         high_missing_dates = date_missing[date_missing > 50].index
+        #         mask_date = ~datetimes.isin(high_missing_dates)
+        #         df_feat = df_feat[mask_date]
+        # logger.info(f"[{instruments_name}] 过滤后特征分布:\n{df_feat.shape}")
+        
+        desc = df_feat.describe().T        
+        logger.info(f"[{instruments_name}] 特征分布:\n{desc}")
+        # 检查极端均值/方差/缺失
+        missing = df_feat.isnull().sum()
+        missing_rate = missing / len(df_feat)
+        # 导出特征缺失率
+        missing_rate_path = f"feature_missing_rate_{instruments_name}.csv"
+        missing_rate.to_csv(missing_rate_path)
+        logger.info(f"[{instruments_name}] 已导出特征缺失率明细: {missing_rate_path}")
+        # 导出缺失样本明细
+        missing_rows_path = f"feature_missing_rows_{instruments_name}.csv"
+        df_feat[df_feat.isnull().any(axis=1)].to_csv(missing_rows_path)
+        logger.info(f"[{instruments_name}] 已导出特征缺失样本明细: {missing_rows_path}")
+        for name, row in desc.iterrows():
+            if abs(row['mean']) > 10 or row['std'] > 10:
+                logger.warning(f"[{instruments_name}] 特征异常: {name} mean={row['mean']:.2f}, std={row['std']:.2f}")
+            if row['count'] < 0.9 * len(df_feat):
+                logger.warning(f"[{instruments_name}] 特征缺失: {name} count={row['count']} / {len(df_feat)}")
+    except Exception as e:
+        logger.error(f"[{instruments_name}] 特征分布统计失败: {e}")
+    # 标签分布
+    try:
+        df_label = dataset.prepare("train", col_set="label")
+        label_imbalance = {}
+        for col in df_label.columns:
+            vc = df_label[col].value_counts(dropna=False)
+            logger.info(f"[{instruments_name}] 标签[{col}]分布:\n{vc}")
+            if vc.min() < 0.05 * vc.sum():
+                logger.warning(f"[{instruments_name}] 标签[{col}]类别极端不均衡: {vc.to_dict()}")
+                label_imbalance[col] = vc
+        # 导出极端不均衡标签明细
+        if label_imbalance:
+            label_imbalance_path = f"label_imbalance_{instruments_name}.csv"
+            pd.DataFrame(label_imbalance).to_csv(label_imbalance_path)
+            logger.info(f"[{instruments_name}] 已导出标签极端不均衡明细: {label_imbalance_path}")
+    except Exception as e:
+        logger.error(f"[{instruments_name}] 标签分布统计失败: {e}")
+
+def batch_experiment(
+    instruments_list=["csi300", "csi500", "csi800", "all"],
+    quantile_list=[0.7, 0.75, 0.8, 0.85],
+    return_days_list=[2, 3, 5],
+    multi_label=False,
+    risk_label=False,
+    device="cpu",
+    start_date="2015-01-01",
+    end_date="2025-12-31"
+):
+    results = []
+    for instruments in instruments_list:
+        for quantile, return_days in itertools.product(quantile_list, return_days_list):
+            print(f"\n==== {instruments} | quantile={quantile} | return_days={return_days} ====")
+            # 1. 数据准备
+            handler = DynamicAlphaCustom(
+                instruments=instruments,
+                start_time=start_date,
+                end_time=end_date,
+                fit_start_time=start_date,
+                fit_end_time=str(int(start_date[:4])+6) + "-12-31"
+            )
+            label_expr, label_names = handler.get_label_config(
+                return_days=return_days,
+                quantile=quantile,
+                multi_label=multi_label,
+                risk_label=risk_label
+            )
+            features, feat_names = handler.get_feature_config()
+            feat_dim = len(features)
+            dataset = DatasetH(
+                handler=handler,
+                segments={
+                    "train": (start_date, str(int(start_date[:4])+7) + "-12-31"),
+                    "valid": (str(int(start_date[:4])+8) + "-01-01", str(int(start_date[:4])+8) + "-12-31"),
+                    "test": (str(int(start_date[:4])+9) + "-01-01", end_date)
+                },
+                label=label_expr,
+                label_name=label_names
+            )
+            # 新增：输出特征和标签分布日志
+            log_feature_and_label_distribution(handler, dataset, instruments, logger)
+            model = get_dynamic_model(instruments, feat_dim, device)
+            model.fit(dataset)
+            # 生成test分段信号，并补齐index
+            test_start = str(int(start_date[:4])+9) + "-01-01"
+            test_end = end_date
+            signal = model.predict(dataset, segment="test")
+            # 若为多index（如多股票），需按日期补齐
+            if hasattr(signal, 'index') and hasattr(signal.index, 'levels') and len(signal.index.levels) == 2:
+                # 多股票信号，补齐所有日期-股票组合
+                idx = pd.MultiIndex.from_product([D.calendar(start_time=test_start, end_time=test_end, freq='day'), signal.index.levels[1]], names=signal.index.names)
+                signal = signal.reindex(idx).fillna(0)
+            else:
+                # 单一index，按日期补齐
+                signal = signal.reindex(D.calendar(start_time=test_start, end_time=test_end, freq='day')).fillna(0)
+            # 回测
+            report, _ = backtest_daily(
+                start_time=test_start,
+                end_time=test_end,
+                strategy=TopkDropoutStrategy(signal=signal, topk=10, n_drop=2),
+                executor={
+                    "class": "SimulatorExecutor",
+                    "module_path": "qlib.backtest.executor",
+                    "kwargs": {
+                        "time_per_step": "day",
+                        "generate_portfolio_metrics": True,
+                        "verbose": False
+                    }
+                }
+            )
+            # 风险分析
+            analysis = enhanced_risk_analysis(report['return'], instruments)
+            # 记录结果
+            result = {
+                "instruments": instruments,
+                "quantile": quantile,
+                "return_days": return_days,
+            }
+            for k, v in analysis["Value"].items():
+                result[k] = v
+            results.append(result)
+            logger.info(f"[{instruments}] 实验结果: {result}")
+            print(analysis)
+    # 输出csv
+    import pandas as pd
+    df = pd.DataFrame(results)
+    df.to_csv("batch_experiment_results.csv", index=False)
+    print("已保存批量实验结果到 batch_experiment_results.csv")
+    # 可视化分析
+    for instruments in instruments_list:
+        sub = df[df["instruments"] == instruments]
+        plt.figure(figsize=(10, 6))
+        for return_days in return_days_list:
+            sub2 = sub[sub["return_days"] == return_days]
+            plt.plot(sub2["quantile"], sub2["Win Rate"], marker='o', label=f"return_days={return_days}")
+        plt.title(f"{instruments} Win Rate vs Quantile")
+        plt.xlabel("quantile")
+        plt.ylabel("Win Rate")
+        plt.legend()
+        plt.savefig(f"{instruments}_winrate_vs_quantile.png")
+        plt.close()
+    print("已生成胜率对比可视化图片")
+
+# 用法示例（可在main中调用）
 if __name__ == "__main__":
     freeze_support()
+    qlib.init(provider_uri="./qlib_data/cn_data", region=REG_CN)
     progressive_train_enhanced(
         instruments_order=["csi300", "csi500", "csi800", "all"],
         device="cuda" if torch.cuda.is_available() else "cpu"
     )
+    # 启动批量实验
+    # batch_experiment(
+    #     instruments_list=["csi500"],  # 可改为全部指数
+    #     quantile_list=[0.7, 0.75, 0.8, 0.85],
+    #     return_days_list=[2, 3, 5, 7],
+    #     multi_label=False,
+    #     risk_label=False,
+    #     device="cpu"
+    # )

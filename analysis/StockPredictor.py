@@ -12,13 +12,14 @@ from typing import Dict, List, Tuple, Optional
 from tqdm import tqdm
 from qlib.contrib.data.handler import DynamicAlphaCustom
 from qlib.config import REG_CN
+import json
 
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('stock_prediction.log'),
+        logging.FileHandler('stock_prediction.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -70,7 +71,7 @@ class StockPredictor:
         instruments: str,
         start_date: str,
         end_date: str,
-        lookback_days: int = 60
+        lookback_days: int = 90
     ) -> Optional[DatasetH]:
         """
         准备预测所需的数据集
@@ -84,6 +85,7 @@ class StockPredictor:
             # 动态调整开始日期以确保有足够的历史数据
             actual_start = (datetime.strptime(start_date, "%Y-%m-%d") - 
                           timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+            logger.info(f"准备数据区间: {start_date} ~ {end_date}, 实际数据起始: {actual_start}, 特征最大窗口期: {lookback_days}天")
             
             # 使用与训练时相同的特征处理器
             handler = DynamicAlphaCustom(
@@ -103,14 +105,43 @@ class StockPredictor:
             )
             
             # 新增：数据完整性检查
-            try:
-                test_data = dataset.prepare("test", col_set=["feature", "label"])
-                assert not test_data.isnull().any().any(), "数据中存在NaN，请检查数据源"
-            except Exception as e:
-                logger.error(f"数据完整性检查未通过: {e}")
-                return None
+            # try:
+            #     test_data = dataset.prepare("test", col_set=["feature", "label"])
+            #     if test_data.isnull().any().any():
+            #         nan_info = test_data.isnull().sum()
+            #         logger.warning(f"数据中存在NaN，各列NaN数量:\n{nan_info}")
+            #         nan_rows = test_data[test_data.isnull().any(axis=1)]
+            #         logger.warning(f"含NaN的样本（前10行）:\n{nan_rows.head(10)}")
+            #         # 新增：打印含NaN样本的股票、日期及其前lookback_days天行情数据
+            #         try:
+            #             import qlib
+            #             for idx in nan_rows.index[:3]:  # 只打印前3个
+            #                 code = idx[1]
+            #                 date = idx[0]
+            #                 start_hist = (pd.to_datetime(date) - pd.Timedelta(days=lookback_days)).strftime('%Y-%m-%d')
+            #                 end_hist = pd.to_datetime(date).strftime('%Y-%m-%d')
+            #                 # 取close、volume等基础行情
+            #                 raw = qlib.data.D.features([code], ["$close", "$volume"], start_hist, end_hist)
+            #                 logger.info(f"{code} {date} 前{lookback_days}天行情数据:\n{raw}")
+            #         except Exception as e:
+            #             logger.warning(f"打印窗口期原始行情数据失败: {e}")
+            #         before = len(test_data)
+            #         test_data = test_data.dropna()
+            #         after = len(test_data)
+            #         logger.warning(f"已自动剔除含NaN样本，剩余样本数: {after}（剔除{before-after}）")
+            #         if after == 0:
+            #             logger.error("剔除NaN后无有效样本")
+            #             return None
+            # except Exception as e:
+            #     logger.error(f"数据完整性检查未通过: {e}")
+            #     if 'test_data' in locals():
+            #         nan_info = test_data.isnull().sum()
+            #         logger.error(f"各列NaN数量:\n{nan_info}")
+            #         nan_rows = test_data[test_data.isnull().any(axis=1)]
+            #         logger.error(f"含NaN的样本（前10行）:\n{nan_rows.head(10)}")
+            #     return None
             
-            logger.info(f"Prepared prediction data for {instruments} from {start_date} to {end_date}")
+            # logger.info(f"Prepared prediction data for {instruments} from {start_date} to {end_date}")
             return dataset
         except Exception as e:
             logger.error(f"Failed to prepare data: {str(e)}")
@@ -155,7 +186,7 @@ class StockPredictor:
         # 设置预测日期 (默认为当前日期)
         end_date = prediction_date or datetime.now().strftime("%Y-%m-%d")
         start_date = (datetime.strptime(end_date, "%Y-%m-%d") - 
-                     timedelta(days=30)).strftime("%Y-%m-%d")  # 一周数据
+                     timedelta(days=7)).strftime("%Y-%m-%d")  # 一周数据
         
         # 准备数据
         dataset = self.prepare_prediction_data(instruments, start_date, end_date)
@@ -232,179 +263,14 @@ class StockPredictor:
             # 在策略生成前动态调整风控参数
             topk, n_drop = dynamic_topk_n_drop(filtered_df['score_norm'], top_k, 2)
 
-            # 创建策略（优先用TopkDropoutStrategy）
-            strategy = TopkDropoutStrategy(
-                signal=signal,
-                topk=topk,
-                n_drop=n_drop
-            )
-            
-            # 执行回测
-            report, positions = backtest_daily(
-                start_time=start_date,
-                end_time=end_date,
-                strategy=strategy,
-                executor={
-                    "class": "SimulatorExecutor",
-                    "module_path": "qlib.backtest.executor",
-                    "kwargs": {
-                        "time_per_step": "day",
-                        "generate_portfolio_metrics": True,
-                        "verbose": False
-                    }
-                }
-            )
-            # 输出positions内容样例
-            try:
-                if isinstance(positions, dict):
-                    logger.info(f'positions dict样例: {list(positions.items())[:2]}')
-                elif hasattr(positions, "head"):
-                    logger.info(f'positions head样例: {positions.head()}')
-                else:
-                    logger.info(f'positions样例: {str(positions)[:200]}')
-            except Exception as e:
-                logger.warning(f'输出positions样例失败: {e}')
-            # 如果positions依然为空或内容异常，尝试用TopkDropoutStrategy(n_drop=0)再回测
-            if (isinstance(positions, dict) and all((not v or (isinstance(v, dict) and len(v) == 0)) for v in positions.values())) or (hasattr(positions, 'empty') and positions.empty):
-                logger.warning('TopkDropoutStrategy未分配有效持仓，尝试用TopkDropoutStrategy(n_drop=0)...')
-                strategy = TopkDropoutStrategy(signal=signal, topk=topk, n_drop=0)
-                report, positions = backtest_daily(
-                    start_time=start_date,
-                    end_time=end_date,
-                    strategy=strategy,
-                    executor={
-                        "class": "SimulatorExecutor",
-                        "module_path": "qlib.backtest.executor",
-                        "kwargs": {
-                            "time_per_step": "day",
-                            "generate_portfolio_metrics": True,
-                            "verbose": False
-                        }
-                    }
-                )
-                try:
-                    if isinstance(positions, dict):
-                        #logger.info(f'[TopkDropoutStrategy(n_drop=0)] positions dict样例: {list(positions.items())[:2]}')
-                        logger.info(f'[TopkDropoutStrategy(n_drop=0)] positions dict')
-                    elif hasattr(positions, "head"):
-                        logger.info(f'[TopkDropoutStrategy(n_drop=0)] positions head样例: {positions.head()}')
-                    else:
-                        logger.info(f'[TopkDropoutStrategy(n_drop=0)] positions样例: {str(positions)[:200]}')
-                except Exception as e:
-                    logger.warning(f'[TopkDropoutStrategy(n_drop=0)] 输出positions样例失败: {e}')
-
-            # 风险分析
-            analysis = self._analyze_backtest(report, instruments)
-
-            # ========== 新增：保存每日持仓明细（修正版） ==========
-            reports_dir = self.model_dir / "reports"
-            reports_dir.mkdir(parents=True, exist_ok=True)
-            pos_file = None
-            holdings = []
-            if isinstance(positions, dict) and len(positions) > 0:
-                for date, v in positions.items():
-                    #logger.info(f'[{date}] v type: {type(v)}, v keys: {list(v.keys()) if hasattr(v, "keys") else v}')
-                   
-                    if isinstance(v, dict):
-                        # 如果v是字典，直接处理
-                        logger.info(f"[{date}] v 已是字典，keys: {list(v.keys())}")
-                    elif hasattr(v, 'to_dict'):
-                        # 如果v有to_dict方法，尝试转换为字典
-                        v_dict = v.to_dict()
-                        if not v_dict:
-                            v_dict = v.__dict__  # 如果to_dict返回None，尝试使用__dict__
-                            logger.info(f"[{date}] v.to_dict()为None，已用__dict__，keys: {list(v_dict.keys())}")
-                        else:
-                            logger.info(f"[{date}] v 已转为 dict, keys: {list(v_dict.keys())}")
-                        v = v_dict
-                    elif hasattr(v, '__dict__'):
-                        # 如果v有__dict__属性，直接使用
-                        v = v.__dict__
-                        #logger.info(f"[{date}] v 使用__dict__转换，keys: {list(v.keys())}")
-                    else:
-                        # 如果无法转换，记录详细信息并跳过
-                        logger.warning(f"[{date}] v 无法转换为字典，类型: {type(v)}, 内容: {str(v)[:200]}")
-                        continue
-
-                    # 检查是否包含position字段
-                    if 'position' in v and isinstance(v['position'], dict):
-                        pos_dict = v['position']
-                        for inst, detail in pos_dict.items():
-                            if str(inst).lower() in ['cash', 'now_account_value']:
-                                continue
-                            if not isinstance(detail, dict):
-                                continue
-                            record = {
-                                'date': date,
-                                'instrument': inst,
-                                'weight': detail.get('weight', None),
-                                'amount': detail.get('amount', None),
-                                'price': detail.get('price', None),
-                                'count_day': detail.get('count_day', None)
-                            }
-                            holdings.append(record)
-                    else:
-                        logger.warning(f"[{date}] 未找到position字段，跳过")
-                logger.info(f"holdings 列表长度: {len(holdings)}")
-                if len(holdings) > 0:
-                    holdings_df = pd.DataFrame(holdings)
-                    logger.info(f"持仓明细DataFrame样例:\n{holdings_df.head()}")
-                    logger.info(f"持仓明细DataFrame总行数: {len(holdings_df)}")
-                    pos_file = reports_dir / f"positions_{instruments}_{start_date}_{end_date}.csv"
-                    logger.info(f"写入路径存在: {reports_dir.exists()}")
-                    try:
-                        holdings_df.to_csv(pos_file, index=False)
-                        logger.info(f"已生成标准化持仓明细文件: {pos_file}")
-                    except Exception as e:
-                        logger.error(f"写入持仓明细CSV失败: {e}")
-                else:
-                    logger.warning("未提取到有效持仓明细，未生成持仓报告文件")
+            # 生成信号输出
+            if output_format == "signals":
+                signals = self._generate_trading_signals(filtered_df, mode="topk", top_k=topk)
+                return signals
+            elif output_format == "portfolio":
+                return self._generate_portfolio(filtered_df, top_k)
             else:
-                logger.warning("positions为空或格式异常，未生成持仓报告文件")
-                pos_file = None
-
-            # ========== 新增：生成每日买卖明细（修正版） ==========
-            trades_file = None
-            trades = []
-            if len(holdings) > 0:
-                holdings_df = pd.DataFrame(holdings)
-                holdings_df['date'] = pd.to_datetime(holdings_df['date'])
-                holdings_df = holdings_df.sort_values(['date', 'instrument'])
-                grouped = holdings_df.groupby('date')['instrument'].apply(set)
-                prev_set = set()
-                for d, cur_set in grouped.items():
-                    buy = list(cur_set - prev_set)
-                    sell = list(prev_set - cur_set)
-                    trades.append({
-                        'date': d,
-                        'buy': ','.join(buy),
-                        'sell': ','.join(sell),
-                        'hold': ','.join(cur_set)
-                    })
-                    prev_set = cur_set
-                if len(trades) > 0:
-                    trades_df = pd.DataFrame(trades)
-                    trades_file = reports_dir / f"trades_{instruments}_{start_date}_{end_date}.csv"
-                    trades_df.to_csv(trades_file, index=False)
-                    logger.info(f"已生成买卖明细文件: {trades_file}")
-                else:
-                    logger.warning("买卖明细为空，未生成买卖报告文件")
-            else:
-                logger.warning("无有效持仓，未生成买卖报告文件")
-                trades_file = None
-
-            # 在持仓明细生成后分析持仓结构
-            if len(holdings) > 0:
-                holdings_df = pd.DataFrame(holdings)
-                analyze_holdings(holdings_df, logger)
-
-            return {
-                "performance": report,
-                "risk_analysis": analysis,
-                "positions": positions,
-                "positions_file": str(pos_file) if pos_file else None,
-                "trades_file": str(trades_file) if trades_file else None
-            }
+                return {"predictions": filtered_df}
         except Exception as e:
             logger.error(f"Backtest failed: {str(e)}")
             return {"error": str(e)}
@@ -488,24 +354,36 @@ class StockPredictor:
         
         return portfolio
     
-    def _generate_trading_signals(self, pred_df: pd.DataFrame) -> Dict:
+    def _generate_trading_signals(self, pred_df: pd.DataFrame, mode: str = "topk", top_k: int = 10, buy_quantile: float = 0.8, sell_quantile: float = 0.2) -> Dict:
         """
         生成交易信号
         :param pred_df: 预测DataFrame
+        :param mode: 'topk' 或 'quantile'，控制信号生成方式
+        :param top_k: TopK方式下买入/卖出股票数量
+        :param buy_quantile: 分位数方式下买入阈值
+        :param sell_quantile: 分位数方式下卖出阈值
         :return: 交易信号字典
         """
-        # 使用分位数生成买卖信号
-        buy_thresh = pred_df["score_norm"].quantile(0.8)
-        sell_thresh = pred_df["score_norm"].quantile(0.2)
-        
-        signals = {
-            "date": pred_df["date"].max().strftime("%Y-%m-%d"),
-            "buy": pred_df[pred_df["score_norm"] > buy_thresh][["instrument", "score_norm"]].values.tolist(),
-            "sell": pred_df[pred_df["score_norm"] < sell_thresh][["instrument", "score_norm"]].values.tolist(),
-            "hold": pred_df[(pred_df["score_norm"] >= sell_thresh) & 
-                          (pred_df["score_norm"] <= buy_thresh)][["instrument", "score_norm"]].values.tolist()
-        }
-        
+        day = pred_df["date"].max()
+        day_df = pred_df[pred_df["date"] == day]
+        if mode == "topk":
+            top_buy = day_df.sort_values("score_norm", ascending=False).head(top_k)
+            top_sell = day_df.sort_values("score_norm", ascending=True).head(top_k)
+            signals = {
+                "date": str(day),
+                "buy": top_buy[["instrument", "score_norm"]].values.tolist(),
+                "sell": top_sell[["instrument", "score_norm"]].values.tolist(),
+                "hold": []
+            }
+        else:
+            buy_thresh = day_df["score_norm"].quantile(buy_quantile)
+            sell_thresh = day_df["score_norm"].quantile(sell_quantile)
+            signals = {
+                "date": str(day),
+                "buy": day_df[day_df["score_norm"] > buy_thresh][["instrument", "score_norm"]].values.tolist(),
+                "sell": day_df[day_df["score_norm"] < sell_thresh][["instrument", "score_norm"]].values.tolist(),
+                "hold": day_df[(day_df["score_norm"] >= sell_thresh) & (day_df["score_norm"] <= buy_thresh)][["instrument", "score_norm"]].values.tolist()
+            }
         return signals
     
     def backtest_strategy(
@@ -784,7 +662,7 @@ class StockPredictor:
             "Annualized Return": float(returns.mean() * 252),
             "Annualized Volatility": float(returns.std() * np.sqrt(252)),
             "Sharpe Ratio": float(returns.mean() / returns.std() * np.sqrt(252)),
-            "Information Ratio": returns.mean() / returns.std()  * np.sqrt(252) if returns.std()  != 0 else 0,
+            #"Information Ratio": returns.mean() / returns.std()  * np.sqrt(252) if returns.std()  != 0 else 0,
             "Max Drawdown": float((returns.cumsum() - returns.cumsum().cummax()).min()),
             "Win Rate": float((returns > 0).mean()),
             "Tail Risk (VaR 5%)": float(returns.quantile(0.05)),
@@ -846,34 +724,35 @@ if __name__ == "__main__":
 
     backtest_start_date = start_test
     backtest_end_date = today
-    all_backtest = predictor.backtest_strategy(
-        instruments="all",
-        start_date=backtest_start_date,
-        end_date=backtest_end_date
-    )
+    # all_backtest = predictor.backtest_strategy(
+    #     instruments="all",
+    #     start_date=backtest_start_date,
+    #     end_date=backtest_end_date
+    # )
     csi800_backtest = predictor.backtest_strategy(
         instruments="csi800",
         start_date=backtest_start_date,
-        end_date=backtest_end_date
+        end_date=backtest_end_date,
+        topk=5
     )
-    csi500_backtest = predictor.backtest_strategy(
-        instruments="csi500",
-        start_date=backtest_start_date,
-        end_date=backtest_end_date
-    )
-    csi300_backtest = predictor.backtest_strategy(
-        instruments="csi300",
-        start_date=backtest_start_date,
-        end_date=backtest_end_date
-    )
-    print("\nall Backtest Results:")
-    if "error" in all_backtest:
-        print(f"Backtest failed: {all_backtest['error']}")
-    elif "risk_analysis" in all_backtest:
-        print(all_backtest["risk_analysis"])
-    else:
-        print("Risk analysis not available")
-        print(f"Available keys: {list(all_backtest.keys())}")
+    # csi500_backtest = predictor.backtest_strategy(
+    #     instruments="csi500",
+    #     start_date=backtest_start_date,
+    #     end_date=backtest_end_date
+    # )
+    # csi300_backtest = predictor.backtest_strategy(
+    #     instruments="csi300",
+    #     start_date=backtest_start_date,
+    #     end_date=backtest_end_date
+    # )
+    # print("\nall Backtest Results:")
+    # if "error" in all_backtest:
+    #     print(f"Backtest failed: {all_backtest['error']}")
+    # elif "risk_analysis" in all_backtest:
+    #     print(all_backtest["risk_analysis"])
+    # else:
+    #     print("Risk analysis not available")
+    #     print(f"Available keys: {list(all_backtest.keys())}")
     
     
     print("\nCSI800 Backtest Results:")
@@ -886,35 +765,42 @@ if __name__ == "__main__":
         print(f"Available keys: {list(csi800_backtest.keys())}")
     
     
-    print("\nCSI500 Backtest Results:")
-    if "error" in csi500_backtest:
-        print(f"Backtest failed: {csi500_backtest['error']}")
-    elif "risk_analysis" in csi500_backtest:
-        print(csi500_backtest["risk_analysis"])
-    else:
-        print("Risk analysis not available")
-        print(f"Available keys: {list(csi500_backtest.keys())}")
+    # print("\nCSI500 Backtest Results:")
+    # if "error" in csi500_backtest:
+    #     print(f"Backtest failed: {csi500_backtest['error']}")
+    # elif "risk_analysis" in csi500_backtest:
+    #     print(csi500_backtest["risk_analysis"])
+    # else:
+    #     print("Risk analysis not available")
+    #     print(f"Available keys: {list(csi500_backtest.keys())}")
     
    
-    print("\nCSI300 Backtest Results:")
-    if "error" in csi300_backtest:
-        print(f"Backtest failed: {csi300_backtest['error']}")
-    elif "risk_analysis" in csi300_backtest:
-        print(csi300_backtest["risk_analysis"])
-    else:
-        print("Risk analysis not available")
-        print(f"Available keys: {list(csi300_backtest.keys())}")
+    # print("\nCSI300 Backtest Results:")
+    # if "error" in csi300_backtest:
+    #     print(f"Backtest failed: {csi300_backtest['error']}")
+    # elif "risk_analysis" in csi300_backtest:
+    #     print(csi300_backtest["risk_analysis"])
+    # else:
+    #     print("Risk analysis not available")
+    #     print(f"Available keys: {list(csi300_backtest.keys())}")
     
-    # 示例3: 生成交易信号
+    #示例3: 生成交易信号
     # signals = predictor.predict_stocks(
     #     instruments="csi800",
-    #     output_format="signals"
+    #     output_format="signals",
+    #     prediction_date="2025-06-10",
+    #     top_k=5
     # )
-    # print("\nTrading Signals:")
+    # try:
+    #     logger.info(f"\nTrading Signals:\n{json.dumps(signals, indent=2, ensure_ascii=False)}")
+    # except TypeError as e:
+    #     logger.warning(f"信号序列化为JSON失败: {e}")
+    #     logger.info(f"signals内容: {signals}")
+
     # if "error" in signals:
     #     print(f"Signal generation failed: {signals['error']}")
-    #     print(f"Buy List: {len(signals['buy'])} stocks")
-    #     print(f"Sell List: {len(signals['sell'])} stocks")
+    #     print(f"Buy List: {len(signals.get('buy', []))} stocks")
+    #     print(f"Sell List: {len(signals.get('sell', []))} stocks")
     # else:
-    #     print(f"Buy List: {len(signals['buy'])} stocks")
-    #     print(f"Sell List: {len(signals['sell'])} stocks")
+    #     print(f"Buy List: {len(signals.get('buy', []))} stocks")
+    #     print(f"Sell List: {len(signals.get('sell', []))} stocks")
