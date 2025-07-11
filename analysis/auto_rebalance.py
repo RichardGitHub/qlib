@@ -2,14 +2,14 @@ import qlib
 from qlib.config import REG_CN
 from datetime import datetime, timedelta
 import pandas as pd
-from StockPredictor import StockPredictor
+from stock_predictor import StockPredictor
 from qlib.contrib.strategy import TopkDropoutStrategy
 from qlib.contrib.evaluate import backtest_daily
 import logging
 import os
 from progressive_train import SafeTransformerModel
 import glob
-from StockPredictor import dynamic_topk_n_drop
+from stock_predictor import dynamic_topk_n_drop
 
 def run_daily_rebalance(
     instruments="csi800",
@@ -211,7 +211,7 @@ if __name__ == "__main__":
     # 示例：指定日期和股票池
     result = run_daily_rebalance(
         instruments="csi800",           # 股票池
-        target_date="2025-06-10",      # 指定调仓日期
+        target_date="2025-07-10",      # 指定调仓日期
         topk=5,
         n_drop=2,
         model_dir="./saved_models"
